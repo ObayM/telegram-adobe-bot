@@ -1,11 +1,11 @@
 import os
-import json # <-- Import json for parsing
+import json
 import base64
 from email import message_from_bytes
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
-# --- MODIFIED: We use from_client_config instead of from_client_secrets_file
+# --- MODIFIED: We use from_client_secrets_file now as well
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -21,8 +21,8 @@ from telegram.ext import (
 )
 from bs4 import BeautifulSoup
 
-# --- MODIFIED: Import the new supabase client functions ---
-from supabase_client import get_user_by_username, get_config_file, save_config_file
+# --- MODIFIED: Removed the unused supabase config functions ---
+from supabase_client import get_user_by_username
 
 # --- CONFIGURATION ---
 from dotenv import load_dotenv
@@ -39,42 +39,39 @@ GET_USERNAME, GET_PASSWORD, AUTHENTICATED = range(3)
 # --- COMPLETELY REWRITTEN FUNCTION ---
 def get_gmail_service():
     """
-    Authenticates with the Gmail API using credentials stored in Supabase.
-    - Fetches 'token.json' from Supabase.
-    - If not found or invalid, it fetches 'credentials.json' from Supabase.
-    - It runs the local auth flow to generate a new token.
-    - It saves the new/refreshed 'token.json' back to Supabase.
+    Authenticates with the Gmail API using local file system credentials.
+    - It tries to load 'token.json' from the local directory.
+    - If not found or invalid, it uses 'credentials.json' to run a local
+      authentication flow, generating a new 'token.json'.
+    - It saves the new or refreshed token back to 'token.json'.
     """
     creds = None
     
-    # 1. Try to load token from Supabase
-    token_info = get_config_file('token.json')
-    if token_info:
-        # Create credentials object from the dictionary fetched from Supabase
-        creds = Credentials.from_authorized_user_info(token_info, SCOPES)
+    # 1. Check if token.json exists and load credentials from it.
+    if os.path.exists('token.json'):
+        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
 
-    # 2. If no valid credentials, run the auth flow
+    # 2. If there are no valid credentials, run the authentication flow.
     if not creds or not creds.valid:
-        # If token is expired, refresh it
+        # If the token is expired and there's a refresh token, refresh it.
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
-        # Otherwise, run the full authentication flow
+        # Otherwise, start a new authentication flow.
         else:
-            # Fetch credentials.json from Supabase
-            client_secrets_info = get_config_file('credentials.json')
-            if not client_secrets_info:
-                print("FATAL ERROR: 'credentials.json' not found in Supabase.")
-                print("Please upload it manually to the 'config_files' table.")
+            # Ensure the credentials.json file exists.
+            if not os.path.exists('credentials.json'):
+                print("FATAL ERROR: 'credentials.json' not found in the local directory.")
+                print("Please download it from Google Cloud Console and place it here.")
                 return None
             
-            # Run flow using the dictionary, not a file path
-            flow = InstalledAppFlow.from_client_config(client_secrets_info, SCOPES)
+            # Run the flow using the credentials.json file.
+            flow = InstalledAppFlow.from_client_secrets_file(
+                'credentials.json', SCOPES)
             creds = flow.run_local_server(port=0)
         
-        # 3. Save the new/refreshed token back to Supabase
-        # creds.to_json() returns a string, but our DB expects a dict (jsonb)
-        # So we parse the string back into a dictionary before saving
-        save_config_file('token.json', json.loads(creds.to_json()))
+        # 3. Save the new or refreshed credentials to token.json.
+        with open('token.json', 'w') as token:
+            token.write(creds.to_json())
             
     return build('gmail', 'v1', credentials=creds)
 # --- END REWRITTEN FUNCTION ---
