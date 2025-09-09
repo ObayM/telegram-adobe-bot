@@ -2,10 +2,13 @@ import os
 import json
 import base64
 from email import message_from_bytes
+from datetime import datetime, timedelta, timezone
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 # --- MODIFIED: We use from_client_secrets_file now as well
+
+from telegram.constants import ParseMode
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -29,11 +32,46 @@ from dotenv import load_dotenv
 load_dotenv()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN") 
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
-LOG_CHAT_ID = -4867116295
+LOG_CHAT_ID = -1003081448550
 
 # --- CONVERSATION STATES ---
 GET_USERNAME, GET_PASSWORD, AUTHENTICATED = range(3)
 # --- END CONFIGURATION ---
+
+def format_time_ago(dt_object: datetime) -> str:
+    """
+    Takes a timezone-aware datetime object and returns a string like
+    '5 minutes ago', '2 hours ago', '3 days ago', etc.
+    """
+    now = datetime.now(timezone.utc)
+    delta = now - dt_object
+    seconds = int(delta.total_seconds())
+
+    if seconds < 60:
+        return f"{seconds} second{'s' if seconds != 1 else ''} ago"
+    
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes} minute{'s' if minutes != 1 else ''} ago"
+    
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours} hour{'s' if hours != 1 else ''} ago"
+    
+    days = hours // 24
+    if days < 7:
+        return f"{days} day{'s' if days != 1 else ''} ago"
+    
+    weeks = days // 7
+    if weeks < 5: # Roughly a month
+        return f"{weeks} week{'s' if weeks != 1 else ''} ago"
+        
+    months = days // 30
+    if months < 12:
+        return f"{months} month{'s' if months != 1 else ''} ago"
+
+    years = days // 365
+    return f"{years} year{'s' if years != 1 else ''} ago"
 
 
 # --- COMPLETELY REWRITTEN FUNCTION ---
@@ -113,7 +151,11 @@ async def get_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         )
         context.user_data.clear()
         return ConversationHandler.END
-
+    
+def escape_markdown_v2(text: str) -> str:
+    """Escapes characters for Telegram's MarkdownV2 parse mode."""
+    escape_chars = r'_*[]()~`>#+-=|{}.!'
+    return text.translate(str.maketrans({char: '\\' + char for char in escape_chars}))
 
 async def handle_email_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handles email fetching for an authenticated user."""
@@ -138,7 +180,20 @@ async def handle_email_request(update: Update, context: ContextTypes.DEFAULT_TYP
             return
 
         msg_id = messages[0]['id']
-        message_data = service.users().messages().get(userId='me', id=msg_id, format='raw').execute()
+        
+        message_data = service.users().messages().get(
+            userId='me', 
+            id=msg_id, 
+            format='raw', 
+            fields='raw,internalDate'
+        ).execute()
+        
+        timestamp_ms = int(message_data['internalDate'])
+        dt_object = datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc)
+        
+        formatted_date = dt_object.strftime("%A, %B %d, %Y at %I:%M %p")
+        time_ago_str = format_time_ago(dt_object)
+        
         raw_email = base64.urlsafe_b64decode(message_data['raw'].encode('ASCII'))
         email_message = message_from_bytes(raw_email)
 
@@ -164,34 +219,55 @@ async def handle_email_request(update: Update, context: ContextTypes.DEFAULT_TYP
             soup = BeautifulSoup(html_body, "html.parser")
             body = soup.get_text(separator='\n', strip=True)
 
+        escaped_date = escape_markdown_v2(formatted_date)
+        escaped_time_ago = escape_markdown_v2(time_ago_str)
+        escaped_email = escape_markdown_v2(email_address)
+        escaped_subject = escape_markdown_v2(subject)
+        escaped_body = escape_markdown_v2(body or '[No readable content found]')
+
+        separator = r'-----------------------------------'.replace('-', r'\-')
+
         response_text = (
-            f"📧 *Latest Email from:* {email_address}\n\n"
-            f"*Subject:* {subject}\n\n"
-            f"-----------------------------------\n\n"
-            f"{body or '[No readable content found]'}"
+            f"📧 *Latest Email from:* {escaped_email}\n\n"
+            f"🗓️ *Date:* {escaped_date}\n"
+            f"⏳ *Received:* {escaped_time_ago}\n"
+            f"*Subject:* {escaped_subject}\n\n"
+            f"{separator}\n\n"
+            f"{escaped_body}"
         )
 
         if len(response_text) > 4096:
-            response_text = response_text[:4090] + "\n\n[Message Truncated]"
-        await update.message.reply_text(response_text, parse_mode='Markdown')
+            response_text = response_text[:4090] + "\n\n\\[Message Truncated\\]"
         
+        # Send the formatted email to the user
+        await update.message.reply_text(response_text, parse_mode=ParseMode.MARKDOWN_V2)
+        
+        # --- MODIFIED LOGGING BLOCK ---
         if LOG_CHAT_ID:
+            # 1. Send the initial log message about the user action
+            escaped_username = escape_markdown_v2(context.user_data.get('username'))
             log_message = (
-                f"✅ **Log: Successful Request**\n\n"
-                f"👤 **Bot User:** `{context.user_data.get('username')}`\n"
-                f"✉️ **Searched Email:** `{email_address}`"
+                f"✅ *Log: Successful Request*\n\n"
+                f"👤 *Bot User:* `{escaped_username}`\n"
+                f"✉️ *Searched Email:* `{escaped_email}`"
             )
             await context.bot.send_message(
                 chat_id=LOG_CHAT_ID, 
                 text=log_message,
-                parse_mode='Markdown'
+                parse_mode=ParseMode.MARKDOWN_V2
+            )
+            
+            # 2. Send the full email content to the log channel as well
+            await context.bot.send_message(
+                chat_id=LOG_CHAT_ID,
+                text=response_text, # Send the same message the user received
+                parse_mode=ParseMode.MARKDOWN_V2
             )
 
     except HttpError as error:
         await update.message.reply_text(f'An API error occurred: {error}')
     except Exception as e:
         await update.message.reply_text(f'An unexpected error occurred: {e}')
-
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Cancels and ends the conversation."""
